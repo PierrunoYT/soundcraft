@@ -306,6 +306,70 @@ fn flac_metadata_fields_beyond_their_block_are_refused() {
     }
 }
 
+/// An EBML element with an 8-byte size.
+fn el(id: &[u8], body: &[u8]) -> Vec<u8> {
+    [id, &[0x01], &(body.len() as u64).to_be_bytes()[1..], body].concat()
+}
+
+fn el_uint(id: &[u8], v: u64) -> Vec<u8> {
+    el(id, &v.to_be_bytes())
+}
+
+/// A Matroska file holding one audio track (`codec`, optional codec private data) and one
+/// SimpleBlock.
+fn mkv(codec: &[u8], private: Option<&[u8]>, block: &[u8]) -> Vec<u8> {
+    let ebml = el(&[0x1A, 0x45, 0xDF, 0xA3], &el(&[0x42, 0x82], b"matroska"));
+    let info = el(&[0x15, 0x49, 0xA9, 0x66], &el_uint(&[0x2A, 0xD7, 0xB1], 1_000_000));
+    let audio = el(&[0xE1], &[el(&[0xB5], &44_100f64.to_be_bytes()), el_uint(&[0x9F], 1), el_uint(&[0x62, 0x64], 16)].concat());
+    let private = private.map(|p| el(&[0x63, 0xA2], p)).unwrap_or_default();
+    let entry = el(&[0xAE], &[el_uint(&[0xD7], 1), el_uint(&[0x73, 0xC5], 1), el_uint(&[0x83], 2), el(&[0x86], codec), private, audio].concat());
+    let tracks = el(&[0x16, 0x54, 0xAE, 0x6B], &entry);
+    let cluster = el(&[0x1F, 0x43, 0xB6, 0x75], &[el_uint(&[0xE7], 0), el(&[0xA3], block)].concat());
+    [ebml, el(&[0x18, 0x53, 0x80, 0x67], &[info, tracks, cluster].concat())].concat()
+}
+
+#[test]
+fn matroska_sizes_beyond_the_file_are_errors_not_aborts() {
+    // A FLAC stream in Matroska: the metadata as codec private data, the frame as one block.
+    let flac = small(FileFormat::Flac, BitDepth::Int16, 1);
+    let mut end = 4;
+    while let [head, a, b, c, ..] = flac[end..] {
+        end += 4 + u32::from_be_bytes([0, a, b, c]) as usize;
+        if head & 0x80 != 0 {
+            break;
+        }
+    }
+    let frame = [&[0x81, 0, 0, 0x80][..], &flac[end..]].concat();
+    let (info, buf) = decode(&mkv(b"A_FLAC", Some(&flac[..end]), &frame), None).unwrap();
+    assert_eq!((info.channels, buf.frames()), (1, 300));
+    let pcm = [&[0x81, 0, 0, 0x80][..], &[0; 600]].concat();
+    // EBML header and DocType claiming 2^48 and 2^47 bytes: once a 128 TiB allocation (abort).
+    let mut header = vec![0x1A, 0x45, 0xDF, 0xA3, 0x01, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+    header.extend_from_slice(&[0x42, 0x82, 0x01, 0x00, 0x80, 0, 0, 0, 0, 0]);
+    header.extend_from_slice(b"matroska");
+    let huge_vint = [0x01, 0x00, 0x00, 0x80, 0, 0, 0, 0];
+    let files = [
+        header,
+        // A zero first size byte, which symphonia reads as a size near 2^63.
+        [mkv(b"A_PCM/INT/LIT", None, &pcm), vec![0x86, 0x00, 0, 0, 0, 0, 0, 0, 0, 0]].concat(),
+        // EBML lacing: two frames, the first claiming 2^39 bytes.
+        mkv(b"A_PCM/INT/LIT", None, &[&[0x81, 0, 0, 0x86, 1][..], &huge_vint, &[0; 16]].concat()),
+        // Xiph lacing: two frames, the first claiming 1030 bytes of a 16-byte block.
+        mkv(b"A_PCM/INT/LIT", None, &[&[0x81, 0, 0, 0x82, 1, 255, 255, 255, 255, 10][..], &[0; 16]].concat()),
+        // Vorbis headers claiming more than the codec private data holds.
+        mkv(b"A_VORBIS", Some(&[2, 255, 255, 255, 1, 1, 0, 0]), &pcm),
+        // An unreadable ID, then a Cluster whose block claims 2^39 bytes.
+        [mkv(b"A_PCM/INT/LIT", None, &pcm), vec![0x00, 0x1F, 0x43, 0xB6, 0x75, 0xFF, 0xA3], huge_vint.to_vec()].concat(),
+    ];
+    for f in files {
+        assert!(matches!(probe(&f, Some("wav")), Err(AudioError::Malformed(m)) if m.contains("larger than the file")));
+        assert!(matches!(decode(&f, None), Err(AudioError::Malformed(m)) if m.contains("larger than the file")));
+    }
+    let nested = (0..40).fold(Vec::new(), |inner, _| el(&[0x67, 0xC8], &inner));
+    let deep = [mkv(b"A_PCM/INT/LIT", None, &pcm), el(&[0x12, 0x54, 0xC3, 0x67], &el(&[0x73, 0x73], &nested))].concat();
+    assert!(matches!(decode(&deep, None), Err(AudioError::Malformed(m)) if m.contains("nested too deeply")));
+}
+
 #[test]
 fn an_id3_tag_before_the_audio_is_skipped_unread() {
     let frame = [&b"TIT2"[..], &0x7fff_ffffu32.to_be_bytes(), &[0, 0, 3, b'h', b'i', 0]].concat();

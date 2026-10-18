@@ -52,6 +52,7 @@ fn open(bytes: &[u8]) -> Result<Box<dyn FormatReader>> {
                     Some(b"ftyp") => crate::mp4::check(bytes, at.saturating_sub(4))?,
                     Some(b"fLaC") => crate::flac::check_metadata(bytes, at)?,
                     Some(b"RIFF") => crate::wav::check_info(bytes, at)?,
+                    Some([0x1A, 0x45, 0xDF, 0xA3]) => crate::mkv::check(bytes, at)?,
                     _ => {}
                 }
                 return reader(mss, &fmt_opts).map_err(map_err);
