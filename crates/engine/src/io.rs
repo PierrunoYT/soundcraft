@@ -289,6 +289,9 @@ pub fn relink_videos(s: &mut Session, session: &Path) -> Vec<String> {
 
 /// Most meter changes a MIDI file may bring into the tempo map; scores have a handful.
 const MAX_MIDI_METERS: usize = 10_000;
+/// Most tempo changes a MIDI file may bring into the tempo map: every tick/sample conversion walks
+/// them all, many times per audio block during playback. A tempo per beat is 1,200 for ten minutes.
+const MAX_MIDI_TEMPOS: usize = 10_000;
 
 /// Import a Standard MIDI File as MIDI tracks (one per SMF track).
 pub fn import_midi_bytes(e: &mut Engine, bytes: &[u8], at: Samples, tempo_map: bool) -> Result<Vec<TrackId>> {
@@ -298,6 +301,9 @@ pub fn import_midi_bytes(e: &mut Engine, bytes: &[u8], at: Samples, tempo_map: b
         // Each meter is placed by walking the ones before it.
         if smf.meters.len() > MAX_MIDI_METERS {
             return Err(EngineError::Io(format!("MIDI file: more than {MAX_MIDI_METERS} meter changes")));
+        }
+        if smf.tempos.len() > MAX_MIDI_TEMPOS {
+            return Err(EngineError::Io(format!("MIDI file: more than {MAX_MIDI_TEMPOS} tempo changes")));
         }
         for (tick, bpm) in &smf.tempos {
             let _ = s.tempo.set_tempo(*tick, *bpm);
@@ -1857,6 +1863,23 @@ mod name_tests {
         let smf = soundcraft_midi::Smf { tracks: vec![soundcraft_midi::SmfTrack { name: String::new(), sequence }], meters, ..Default::default() };
         let err = import_midi_bytes(&mut Engine::default(), &soundcraft_midi::write_smf(&smf).unwrap(), 0, true).unwrap_err();
         assert!(err.to_string().contains("meter changes"), "{err}");
+    }
+
+    #[test]
+    fn midi_with_more_tempo_changes_than_performances_have_is_refused() {
+        let note = soundcraft_midi::Note { pitch: 60, velocity: 100, release_velocity: 64, channel: 0, start: 0, length: 960 };
+        let sequence = soundcraft_midi::Sequence { notes: vec![note], ..Default::default() };
+        let smf = |n: usize| soundcraft_midi::Smf {
+            tracks: vec![soundcraft_midi::SmfTrack { name: String::new(), sequence: sequence.clone() }],
+            tempos: (0..n as i64).map(|beat| (beat * 960, 100.0 + (beat % 40) as f64)).collect(),
+            ..Default::default()
+        };
+        let mut e = Engine::default();
+        let err = import_midi_bytes(&mut e, &soundcraft_midi::write_smf(&smf(MAX_MIDI_TEMPOS + 1)).unwrap(), 0, true).unwrap_err();
+        assert!(err.to_string().contains("tempo changes"), "{err}");
+        assert_eq!((e.session().tempo.tempos().len(), e.session().tracks.len()), (1, 0), "nothing is imported");
+        import_midi_bytes(&mut e, &soundcraft_midi::write_smf(&smf(MAX_MIDI_TEMPOS)).unwrap(), 0, true).unwrap();
+        assert_eq!(e.session().tempo.tempos().len(), MAX_MIDI_TEMPOS);
     }
 
     #[test]
