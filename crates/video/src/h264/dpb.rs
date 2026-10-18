@@ -134,8 +134,20 @@ impl Dpb {
         poc_state: &mut dyn FnMut(u32),
     ) {
         let mut unused = (prev_ref_frame_num + 1) % max_frame_num;
+        // The sliding window keeps at most `max_num_ref_frames` short-term references and drops the
+        // oldest first, so of a long gap only the last frames are still references when it ends.
+        // The earlier ones still advance POC, but their pictures (a full frame each, up to 65535 of
+        // them) are never built.
+        let gap = (frame_num % max_frame_num + max_frame_num - unused) % max_frame_num;
+        let unseen = gap.saturating_sub(u32::try_from(max_num_ref_frames.max(1)).unwrap_or(u32::MAX));
         let mut guard = 0;
         while unused != frame_num && guard < max_frame_num {
+            if guard < unseen {
+                poc_state(unused);
+                unused = (unused + 1) % max_frame_num;
+                guard += 1;
+                continue;
+            }
             self.sliding_window(unused, max_frame_num, max_num_ref_frames);
             let (frame, meta) = make_frame(unused);
             poc_state(unused);
@@ -416,5 +428,97 @@ impl Dpb {
 impl Default for Dpb {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::h264::picture::Frame;
+
+    fn meta() -> Arc<OutputMeta> {
+        Arc::new(OutputMeta {
+            pts: 0,
+            key: false,
+            crop: (0, 0, 16, 16),
+            full_range: false,
+            colour_primaries: 2,
+            transfer_characteristics: 2,
+            matrix_coefficients: 2,
+            sar: (1, 1),
+            draft: false,
+        })
+    }
+
+    fn entry(id: u32, frame_num: u32, mark: RefMark, needed_for_output: bool) -> DpbEntry {
+        DpbEntry {
+            frame: Arc::new(Frame::new(id, 0, 1, 1)),
+            poc: 0,
+            frame_num,
+            long_term_frame_idx: id,
+            mark,
+            needed_for_output,
+            non_existing: false,
+            meta: meta(),
+        }
+    }
+
+    /// A DPB with references (short and long term) and a picture waiting for output.
+    fn dpb() -> Dpb {
+        let mut d = Dpb::new();
+        d.entries = vec![entry(1, 7, RefMark::Long, false), entry(2, 9, RefMark::Short, true), entry(3, 10, RefMark::Short, false)];
+        d
+    }
+
+    fn summary(d: &Dpb) -> Vec<(u32, RefMark, bool, bool)> {
+        d.entries.iter().map(|e| (e.frame_num, e.mark, e.needed_for_output, e.non_existing)).collect()
+    }
+
+    /// 8.2.5.2 as written: every missing frame number gets a picture, then sliding-window marking.
+    fn every_frame(d: &mut Dpb, prev: u32, frame_num: u32, max: u32, refs: usize) {
+        let mut unused = (prev + 1) % max;
+        while unused != frame_num {
+            d.sliding_window(unused, max, refs);
+            d.entries.push(DpbEntry {
+                frame: Arc::new(Frame::new(1000 + unused, 0, 1, 1)),
+                poc: 0,
+                frame_num: unused,
+                long_term_frame_idx: 0,
+                mark: RefMark::Short,
+                needed_for_output: false,
+                non_existing: true,
+                meta: meta(),
+            });
+            unused = (unused + 1) % max;
+        }
+    }
+
+    #[test]
+    fn a_frame_num_gap_builds_only_the_frames_that_stay_references() {
+        let (mut made, mut pocs) = (Vec::new(), Vec::new());
+        let mut d = dpb();
+        let mut make = |n: u32| {
+            made.push(n);
+            (Arc::new(Frame::new(1000 + n, 0, 1, 1)), meta())
+        };
+        d.fill_frame_num_gap(10, 9, 1 << 16, 4, &mut make, &mut |n| pocs.push(n));
+        // 65534 missing frame numbers (wrapping past 0): POC sees each, four pictures are built.
+        assert_eq!(pocs.len(), 65534);
+        assert_eq!(pocs.first(), Some(&11));
+        assert_eq!(pocs.last(), Some(&8));
+        assert_eq!(made, vec![5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn skipping_unseen_gap_frames_leaves_the_dpb_as_building_them_would() {
+        for (prev, frame_num, max, refs) in
+            [(10, 9, 1 << 16, 4), (10, 30, 64, 4), (10, 13, 64, 4), (10, 15, 64, 1), (60, 5, 64, 3), (10, 11, 16, 16), (10, 2, 16, 2)]
+        {
+            let mut want = dpb();
+            every_frame(&mut want, prev, frame_num, max, refs);
+            let mut got = dpb();
+            got.fill_frame_num_gap(prev, frame_num, max, refs, &mut |n| (Arc::new(Frame::new(1000 + n, 0, 1, 1)), meta()), &mut |_| {});
+            assert_eq!(summary(&got), summary(&want), "gap {prev} -> {frame_num} (max {max}, {refs} refs)");
+        }
     }
 }
