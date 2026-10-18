@@ -1145,6 +1145,9 @@ impl std::fmt::Write for Key {
     }
 }
 
+/// Most gain Clip Effects apply (dB).
+const CLIP_FX_MAX_GAIN_DB: f32 = 24.0;
+
 impl ClipFx {
     fn new(sr: f32, ch: usize) -> ClipFx {
         ClipFx { eq: None, comp: None, gain_db: 0.0, sr, ch }
@@ -1184,7 +1187,8 @@ impl ClipFx {
                     c.set_param(p, v);
                 }
             } else if k == "gain" {
-                self.gain_db = v;
+                // The Clip Effects window offers -36 to +24 dB; a session file or command can say anything.
+                self.gain_db = if v.is_finite() { v.clamp(soundcraft_dsp::MIN_DB, CLIP_FX_MAX_GAIN_DB) } else { 0.0 };
             }
         }
     }
@@ -1718,7 +1722,8 @@ fn pan_at(t: &Track, idx: usize, pos: Samples) -> f32 {
         && let Some(l) = t.lane(&AutoParam::Pan(u8::try_from(idx).unwrap_or(0)))
         && !l.points.is_empty()
     {
-        return l.value_at(pos, base);
+        // Like volume, never above the fader's +12 dB, whatever a lane loaded from a file holds.
+        return l.value_at(pos, base).min(12.0);
     }
     base
 }
@@ -1745,7 +1750,8 @@ fn send_level(t: &Track, i: usize, base: f32, pos: Samples) -> f32 {
         && let Some(l) = t.lane(&AutoParam::SendLevel(u8::try_from(i).unwrap_or(0)))
         && !l.points.is_empty()
     {
-        return l.value_at(pos, base);
+        // Like volume, never above the fader's +12 dB, whatever a lane loaded from a file holds.
+        return l.value_at(pos, base).min(12.0);
     }
     base
 }
@@ -2851,6 +2857,33 @@ mod tests {
         s.track_mut(t).unwrap().lane_mut(&AutoParam::Plugin { slot: u8::MAX, param: "trim".into() }).set_point(0, -12.0);
         let out = render_range(&s, Range::new(0, 4800), 512);
         assert!(out[0][2000] < 0.2, "{}", out[0][2000]);
+    }
+
+    #[test]
+    fn clip_effects_gain_and_send_level_lanes_stay_in_range() {
+        let (mut s, t) = session_with_dc(0.5, 4800);
+        let cid = s.track(t).unwrap().clips()[0].id.0;
+        s.edit.values.insert(format!("clip_fx.{cid}.gain"), 500.0);
+        let out = render_range(&s, Range::new(0, 4800), 512);
+        let most = 0.5 * std::f32::consts::FRAC_1_SQRT_2 * db_to_gain(24.0);
+        assert!((out[0][2000] - most).abs() < 0.01, "clip effects gain is capped at +24 dB: {}", out[0][2000]);
+        s.edit.values.insert(format!("clip_fx.{cid}.gain"), f64::NAN);
+        let out = render_range(&s, Range::new(0, 4800), 512);
+        assert!((out[0][2000] - 0.5 * std::f32::consts::FRAC_1_SQRT_2).abs() < 0.01, "{}", out[0][2000]);
+        s.edit.values.clear();
+        // A send-level lane as a session file may hold it, past the +12 dB a lane is written with.
+        let bus = s.add_bus("Verb", ChannelFormat::Stereo);
+        let aux = s.add_track(TrackKind::Aux, ChannelFormat::Stereo, Some("Verb"));
+        s.track_mut(aux).unwrap().mixer.input = Route::Bus(bus);
+        let tr = s.track_mut(t).unwrap();
+        tr.mixer.output = Route::None;
+        tr.mixer.sends[0] = Some(soundcraft_model::SendSlot::new(Route::Bus(bus)));
+        tr.lane_mut(&AutoParam::SendLevel(0)).points = vec![soundcraft_model::AutomationPoint { at: 0, value: 300.0 }];
+        let loud = render_range(&s, Range::new(0, 4800), 512);
+        s.track_mut(t).unwrap().lane_mut(&AutoParam::SendLevel(0)).points[0].value = 12.0;
+        let at_12 = render_range(&s, Range::new(0, 4800), 512);
+        assert!(at_12[0][2000] > 0.1);
+        assert!((loud[0][2000] - at_12[0][2000]).abs() < 1e-4, "{} vs {}", loud[0][2000], at_12[0][2000]);
     }
 
     #[test]

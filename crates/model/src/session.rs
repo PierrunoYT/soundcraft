@@ -579,6 +579,9 @@ impl Session {
             }
             for l in &mut t.automation {
                 l.points.retain(|p| p.value.is_finite());
+                // Within what `set_point` would have written (a send level of +300 dB is +12 dB).
+                let (lo, hi, _) = l.param.range();
+                l.points.iter_mut().for_each(|p| p.value = p.value.clamp(lo, hi));
                 l.points.iter_mut().for_each(|p| bound(&mut p.at));
                 l.points.sort_by_key(|p| p.at);
             }
@@ -651,6 +654,7 @@ pub fn truncate_chars(s: &mut String, max: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::automation::{AutoParam, AutomationPoint};
 
     #[test]
     fn add_tracks_names_and_order() {
@@ -768,10 +772,14 @@ mod tests {
             tr.mixer.volume_db = f32::NAN;
         }
         s.next_id = 0;
+        let send = s.track_mut(t).unwrap().lane_mut(&AutoParam::SendLevel(0));
+        send.points = vec![AutomationPoint { at: 0, value: 300.0 }, AutomationPoint { at: 1, value: -1e9 }];
         s.sanitize();
         let tr = s.track(t).unwrap();
         assert_eq!(tr.active_playlist, 0);
         assert_eq!(tr.mixer.volume_db, 0.0);
+        let send = tr.lane(&AutoParam::SendLevel(0)).unwrap();
+        assert_eq!(send.points.iter().map(|p| p.value).collect::<Vec<_>>(), vec![12.0, -144.0]);
         assert!(s.next_id > t.0);
     }
 }
